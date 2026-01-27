@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--# Author      : Weblytic Labs Pvt. Ltd. (<https://store.weblyticlabs.com/>)-->
+<!--# Copyright(c): 2023-Present Weblytic Labs Pvt. Ltd.-->
+<odoo>
+    <template id="maya_redirect_form" name="Maya Redirect Form">
+        <form t-att-action="tx_url" method="get" class="o_payment_redirect_form">
+            <input type="hidden" name="tx_id" t-att-value="tx.id"/>
+            <button type="submit" class="btn btn-primary">Pay with Maya</button>
+        </form>
+    </template>
+</odoo>
+
+

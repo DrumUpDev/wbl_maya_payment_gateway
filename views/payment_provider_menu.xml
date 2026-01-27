@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--# Author      : Weblytic Labs Pvt. Ltd. (<https://store.weblyticlabs.com/>)-->
+<!--# Copyright(c): 2023-Present Weblytic Labs Pvt. Ltd.-->
+<odoo>
+    <menuitem id="menu_maya_configuration"
+              name="Maya Configuration"
+              parent="website.menu_website_configuration"
+              sequence="70"/>
+</odoo>

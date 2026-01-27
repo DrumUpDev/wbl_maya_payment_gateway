@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--# Author      : Weblytic Labs Pvt. Ltd. (<https://store.weblyticlabs.com/>)-->
+<!--# Copyright(c): 2023-Present Weblytic Labs Pvt. Ltd.-->
+<odoo>
+    <record id="view_payment_provider_form_inherit_credentials" model="ir.ui.view">
+        <field name="name">payment.provider.form.inherit.credentials.fields</field>
+        <field name="model">payment.provider</field>
+        <field name="inherit_id" ref="payment.payment_provider_form"/>  <!-- inherit from original view -->
+        <field name="arch" type="xml">
+            <!-- XPath to target the 'Credentials' page/tab -->
+            <xpath expr="//page[@name='credentials']" position="inside">
+                <group>
+                    <field name="maya_public_key" password="True"/>
+                    <field name="maya_secret_key" password="True"/>
+                </group>
+            </xpath>
+        </field>
+    </record>
+</odoo>

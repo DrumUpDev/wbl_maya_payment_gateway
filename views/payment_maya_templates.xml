@@ -5,9 +5,9 @@
     <template id="maya_redirect_form" name="Maya Redirect Form">
         <form t-att-action="tx_url" method="get" class="o_payment_redirect_form">
             <input type="hidden" name="tx_id" t-att-value="tx.id"/>
+            <input type="hidden" name="access_token" t-att-value="tx_access_token"/>
             <button type="submit" class="btn btn-primary">Pay with Maya</button>
         </form>
     </template>
 </odoo>
-
 

@@ -36,11 +36,14 @@ class MayaRefundAmountWizard(models.TransientModel):
             if payment.payment_transaction_id:
                 # Get PHP currency record
                 php_currency = self.env['res.currency'].search([('name', '=', 'PHP')], limit=1)
+                tx = payment.payment_transaction_id
+                refunded_amount = tx.currency_id.round(tx.maya_refunded_amount or 0.0)
+                remaining_amount = tx.currency_id.round(tx.amount - refunded_amount)
 
                 res.update({
-                    'refund_amount': payment.payment_transaction_id.amount,
-                    'currency_id': php_currency.id if php_currency else payment.payment_transaction_id.currency_id.id,
-                    'transaction_parent_id': payment.payment_transaction_id.id,
+                    'refund_amount': max(remaining_amount, 0.0),
+                    'currency_id': php_currency.id if php_currency else tx.currency_id.id,
+                    'transaction_parent_id': tx.id,
                 })
         return res
 

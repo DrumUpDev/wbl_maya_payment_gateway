@@ -18,7 +18,7 @@ import logging
 import requests
 from odoo import api, fields, models
 from odoo.exceptions import UserError, ValidationError
-from odoo.osv.expression import AND, OR
+from odoo.addons.payment import utils as payment_utils
 
 _logger = logging.getLogger(__name__)
 
@@ -45,6 +45,20 @@ MAYA_FAIL_SCENARIOS = frozenset([
 MAYA_NEUTRAL_SCENARIOS = frozenset([
     'authorized',
     'checkout_success',  # checkout created/redirected is not always paid
+])
+
+MAYA_SUCCESS_PAYMENT_STATUSES = frozenset([
+    'payment_success',
+    'paid',
+    'completed',
+])
+
+MAYA_FAIL_PAYMENT_STATUSES = frozenset([
+    'payment_failed',
+    'failed',
+    'expired',
+    'cancelled',
+    'canceled',
 ])
 
 
@@ -95,6 +109,13 @@ class PaymentTransaction(models.Model):
         copy=False,
         index=True,
     )
+    maya_refunded_amount = fields.Monetary(
+        string="Maya Refunded Amount",
+        currency_field='currency_id',
+        readonly=True,
+        copy=False,
+        help="Cumulative refunded amount requested through Maya for this transaction.",
+    )
 
    
 
@@ -121,9 +142,12 @@ class PaymentTransaction(models.Model):
         if self.provider_code != 'maya':
             return super()._get_specific_rendering_values(processing_values)
 
+        tx_access_token = payment_utils.generate_access_token(self.reference, self.partner_id.id)
+
         return {
             'tx': self,
-            'tx_url': "/payment/maya/redirect?tx_id=%s" % self.id,
+            'tx_url': "/payment/maya/redirect",
+            'tx_access_token': tx_access_token,
         }
 
     @api.model
@@ -155,6 +179,8 @@ class PaymentTransaction(models.Model):
                 or data.get('scenario')
                 or data.get('event')
                 or data.get('type')
+                or data.get('paymentStatus')
+                or payload.get('paymentStatus')
                 or data.get('status')
                 or payload.get('status')
                 or ''
@@ -165,10 +191,114 @@ class PaymentTransaction(models.Model):
         return normalized
 
     @api.model
-    def _maya_resolve_from_webhook_payload(self, payload):
+    def _maya_extract_payment_status_from_api_payload(self, payload):
+        """
+        Extract payment status from different Maya status API response shapes.
+        Returns (raw_status, normalized_status).
+        """
+        def _normalize(value):
+            normalized = (value or '').strip().lower()
+            return normalized.replace(' ', '_').replace('-', '_').replace('.', '_')
+
+        candidates = []
+        if isinstance(payload, dict):
+            candidates.append(payload)
+            for key in ('data', 'payment', 'result'):
+                container = payload.get(key)
+                if isinstance(container, dict):
+                    candidates.append(container)
+            for key in ('payments', 'results'):
+                items = payload.get(key)
+                if isinstance(items, list):
+                    candidates.extend(item for item in items if isinstance(item, dict))
+        elif isinstance(payload, list):
+            candidates.extend(item for item in payload if isinstance(item, dict))
+
+        for candidate in candidates:
+            for field_name in ('paymentStatus', 'status'):
+                raw_status = candidate.get(field_name)
+                if raw_status:
+                    return raw_status, _normalize(raw_status)
+        return '', ''
+
+    def _maya_try_mark_done_from_status_api(self):
+        """
+        Fallback on success redirect:
+        query Maya status API and mark transaction done only when provider confirms payment success.
+        """
+        self.ensure_one()
+        if self.provider_id.code != 'maya' or self.state == 'done':
+            return False
+
+        provider = self.provider_id
+        payment_id = self.provider_reference or self.maya_checkout_id or self.maya_transaction_id
+        if not payment_id:
+            _logger.info("Maya status fallback skipped tx=%s reason=no_payment_id", self.id)
+            return False
+        if not provider.maya_secret_key:
+            _logger.info("Maya status fallback skipped tx=%s reason=no_secret_key", self.id)
+            return False
+
+        url = "%s/payments/v1/payments/%s" % (provider._maya_get_api_base_url(), payment_id)
+        timeout = provider.maya_api_timeout or 30
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": "Basic " + base64.b64encode((provider.maya_secret_key + ":").encode()).decode(),
+        }
+
+        try:
+            response = requests.get(url, headers=headers, timeout=timeout)
+        except requests.RequestException:
+            _logger.exception("Maya status fallback API call failed tx=%s", self.id)
+            return False
+
+        if response.status_code not in (200, 201):
+            _logger.warning(
+                "Maya status fallback non-success tx=%s status=%s",
+                self.id,
+                response.status_code,
+            )
+            return False
+
+        try:
+            status_payload = response.json()
+        except ValueError:
+            _logger.warning("Maya status fallback non-JSON response tx=%s", self.id)
+            return False
+
+        raw_status, normalized_status = self._maya_extract_payment_status_from_api_payload(status_payload)
+        if normalized_status not in MAYA_SUCCESS_PAYMENT_STATUSES:
+            _logger.info(
+                "Maya status fallback not_paid tx=%s payment_id=%s status=%s",
+                self.id,
+                payment_id,
+                normalized_status or 'unknown',
+            )
+            return False
+
+        apply_payload = {
+            'data': {
+                'id': payment_id,
+                'checkoutId': payment_id,
+                'paymentStatus': raw_status or normalized_status,
+                'status': raw_status or normalized_status,
+            }
+        }
+        result = self._maya_apply_webhook_scenario('checkout_success', apply_payload)
+        _logger.info(
+            "Maya status fallback confirmed tx=%s payment_id=%s status=%s result=%s",
+            self.id,
+            payment_id,
+            normalized_status,
+            result,
+        )
+        return self.state == 'done'
+
+    @api.model
+    def _maya_resolve_from_webhook_payload(self, payload, provider=None):
         """
         Resolve transaction using a single OR domain (review-aware),
-        scoped to Maya provider only.
+        scoped to Maya providers, or to a specific verified provider when given.
         """
         if not isinstance(payload, dict):
             return self.browse()
@@ -205,10 +335,14 @@ class PaymentTransaction(models.Model):
         if not subdomains:
             return self.browse()
 
-        domain = AND([
-            [('provider_id.code', '=', 'maya')],
-            OR(subdomains),
-        ])
+        provider_domain = fields.Domain('provider_id.code', '=', 'maya')
+        if provider:
+            provider.ensure_one()
+            provider_domain = fields.Domain('provider_id', '=', provider.id)
+
+        domain = provider_domain & fields.Domain.OR(
+            fields.Domain(subdomain) for subdomain in subdomains
+        )
 
         return self.sudo().search(domain, limit=1, order='id DESC')
 
@@ -224,6 +358,14 @@ class PaymentTransaction(models.Model):
         data = payload.get('data') if isinstance(payload.get('data'), dict) else payload
 
         normalized = self._maya_extract_scenario(payload, default_scenario=scenario)
+        payment_status = (
+            data.get('paymentStatus')
+            or payload.get('paymentStatus')
+            or data.get('status')
+            or payload.get('status')
+            or ''
+        )
+        normalized_payment_status = (payment_status or '').strip().lower().replace(' ', '_').replace('-', '_').replace('.', '_')
 
         vals = {
             'maya_status': normalized or 'webhook_received',
@@ -244,7 +386,14 @@ class PaymentTransaction(models.Model):
             vals['maya_transaction_id'] = checkout_id
 
         # Set provider_reference only after verified webhook (not redirect).
-        if normalized in MAYA_SUCCESS_SCENARIOS and checkout_id and not self.provider_reference:
+        if (
+            checkout_id
+            and not self.provider_reference
+            and (
+                normalized in MAYA_SUCCESS_SCENARIOS
+                or normalized_payment_status in MAYA_SUCCESS_PAYMENT_STATUSES
+            )
+        ):
             vals['provider_reference'] = checkout_id
 
         self.write(vals)
@@ -260,6 +409,18 @@ class PaymentTransaction(models.Model):
                 return 'ignored_fail_on_done'
             self._set_canceled()
             return 'state_set_canceled'
+
+        # Some Maya webhook routes use generic scenarios, while paymentStatus carries the real result.
+        if normalized_payment_status in MAYA_SUCCESS_PAYMENT_STATUSES:
+            if self.state != 'done':
+                self._set_done()
+                return 'state_set_done_by_payment_status'
+            return 'already_done'
+        if normalized_payment_status in MAYA_FAIL_PAYMENT_STATUSES:
+            if self.state == 'done':
+                return 'ignored_fail_on_done'
+            self._set_canceled()
+            return 'state_set_canceled_by_payment_status'
 
         if normalized in MAYA_NEUTRAL_SCENARIOS:
             if self.state == 'draft':
@@ -279,11 +440,36 @@ class PaymentTransaction(models.Model):
         if self.provider_id.code != 'maya':
             raise UserError("Not a Maya transaction.")
 
-        if not amount or float(amount) <= 0:
-            raise UserError("Refund amount must be greater than zero.")
+        if self.source_transaction_id or self.operation == 'refund':
+            raise UserError("Refund can only be requested from the original payment transaction.")
+
+        if self.state != 'done':
+            raise UserError("Only confirmed transactions can be refunded.")
 
         if self.currency_id.name != 'PHP':
             raise UserError("Maya refund supports PHP only for this integration.")
+
+        self._ensure_provider_is_not_disabled()
+
+        # Lock row to avoid concurrent refund requests bypassing amount checks.
+        self.env.cr.execute(
+            "SELECT id FROM payment_transaction WHERE id = %s FOR UPDATE",
+            (self.id,),
+        )
+
+        requested_amount = self.currency_id.round(float(amount or 0.0))
+        if self.currency_id.compare_amounts(requested_amount, 0.0) <= 0:
+            raise UserError("Refund amount must be greater than zero.")
+
+        already_refunded = self.currency_id.round(self.maya_refunded_amount or 0.0)
+        remaining_amount = self.currency_id.round(self.amount - already_refunded)
+        if self.currency_id.compare_amounts(remaining_amount, 0.0) <= 0:
+            raise UserError("This transaction is already fully refunded.")
+        if self.currency_id.compare_amounts(requested_amount, remaining_amount) > 0:
+            raise UserError(
+                "Refund amount exceeds refundable balance. Remaining refundable amount: %s"
+                % self.currency_id.format(remaining_amount)
+            )
 
         provider_ref = self.provider_reference or self.maya_checkout_id or self.maya_transaction_id
         if not provider_ref:
@@ -316,7 +502,7 @@ class PaymentTransaction(models.Model):
             },
             "amount": {
                 "currency": "PHP",
-                "value": round(float(amount), 2),
+                "value": round(requested_amount, 2),
             },
             "reason": "Customer requested refund",
         }
@@ -339,10 +525,13 @@ class PaymentTransaction(models.Model):
         if response.status_code not in (200, 201):
             raise UserError("Refund failed: %s" % (result.get('message') or response.text))
 
+        updated_refunded_amount = self.currency_id.round(already_refunded + requested_amount)
+
         self.write({
             "maya_refund_id": result.get("refundId"),
             "maya_refund_status": result.get("status") or result.get("refundStatus") or "requested",
             "maya_refund_currency": (result.get("amount") or {}).get("currency") or "PHP",
+            "maya_refunded_amount": updated_refunded_amount,
         })
 
         return True

@@ -39,9 +39,10 @@ class MayaWebhookEvent(models.Model):
     payload = fields.Text(readonly=True)
     processing_message = fields.Char(readonly=True)
 
-    _sql_constraints = [
-        ('maya_webhook_event_key_uniq', 'unique(event_key)', 'Webhook event already processed.'),
-    ]
+    _event_key_uniq = models.Constraint(
+        'UNIQUE(provider_id, event_key)',
+        'Webhook event already processed for this provider.',
+    )
 
     @api.autovacuum
     def _gc_old_maya_webhook_events(self):
@@ -53,4 +54,3 @@ class MayaWebhookEvent(models.Model):
         if old_records:
             old_records.unlink()
         return True
-

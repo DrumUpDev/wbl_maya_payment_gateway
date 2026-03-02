@@ -11,10 +11,12 @@
 ##################################################################################
 
 # -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 import base64
 import hashlib
 import json
 import logging
+import re
 
 import requests
 from psycopg2 import IntegrityError
@@ -24,6 +26,7 @@ from werkzeug.wrappers import Response
 
 from odoo import http
 from odoo.http import request
+from odoo.addons.payment import utils as payment_utils
 
 _logger = logging.getLogger(__name__)
 
@@ -64,12 +67,74 @@ class MayaController(http.Controller):
         seed = f"{scenario}|{checkout_id}|".encode("utf-8") + (raw_body or b"")
         return hashlib.sha256(seed).hexdigest()
 
+    @staticmethod
+    def _split_name(full_name):
+        full_name = (full_name or "").strip()
+        if not full_name:
+            return "", ""
+        parts = full_name.split()
+        first_name = parts[0]
+        last_name = " ".join(parts[1:]) if len(parts) > 1 else ""
+        return first_name, last_name
+
+    @staticmethod
+    def _normalize_ph_phone(raw_phone):
+        """
+        Normalize PH phone to +63XXXXXXXXXX where possible.
+        Returns "" if invalid/unusable.
+        """
+        raw_phone = (raw_phone or "").strip()
+        if not raw_phone:
+            return ""
+
+        digits = re.sub(r"\D", "", raw_phone)
+
+        # 0917xxxxxxx -> 63917xxxxxxx
+        if digits.startswith("0") and len(digits) >= 11:
+            digits = "63" + digits[1:]
+        # 917xxxxxxx -> 63917xxxxxxx
+        elif digits.startswith("9") and len(digits) >= 10:
+            digits = "63" + digits
+        # already 63xxxxxxxxxx
+        elif digits.startswith("63"):
+            pass
+        else:
+            return ""
+
+        return "+" + digits
+
+    @staticmethod
+    def _public_base_url(provider):
+        """
+        Use configured public base URL for redirect callbacks.
+        Never use localhost/127.0.0.1 for gateway redirects.
+        """
+        base_url = (provider.get_base_url() or "").strip().rstrip("/")
+        if not base_url:
+            base_url = (
+                request.env["ir.config_parameter"]
+                .sudo()
+                .get_param("web.base.url", "")
+                .strip()
+                .rstrip("/")
+            )
+
+        if not base_url.startswith(("http://", "https://")):
+            raise BadRequest("Invalid web base URL configuration.")
+
+        lowered = base_url.lower()
+        if "localhost" in lowered or "127.0.0.1" in lowered:
+            raise BadRequest("web.base.url must be a public URL, not localhost.")
+
+        return base_url
+
     @http.route(['/payment/maya/redirect'], type='http', auth='public', website=True)
     def maya_redirect(self, **post):
         """
         Create checkout and redirect customer to Maya hosted page.
         """
         tx_id = post.get('tx_id')
+        access_token = post.get('access_token')
         try:
             tx_id = int(tx_id)
         except (TypeError, ValueError):
@@ -78,17 +143,35 @@ class MayaController(http.Controller):
         tx = request.env['payment.transaction'].sudo().browse(tx_id)
         if not tx.exists() or tx.provider_id.code != 'maya':
             raise NotFound()
+        if not payment_utils.check_access_token(access_token, tx.reference, tx.partner_id.id):
+            raise NotFound()
+
+        tx_access_token = payment_utils.generate_access_token(tx.reference, tx.partner_id.id)
 
         provider = tx.provider_id.sudo()
 
+        # Transaction validations
         if tx.amount <= 0:
             raise BadRequest("Invalid transaction amount.")
-
         if tx.currency_id.name != 'PHP':
             raise BadRequest("Maya only supports PHP transactions.")
-
         if not provider.maya_public_key:
             raise BadRequest("Maya public key is not configured.")
+
+        # Buyer validations
+        first_name, last_name = self._split_name(tx.partner_id.name)
+        email = (tx.partner_id.email or "").strip()
+        phone = self._normalize_ph_phone(tx.partner_id.phone or getattr(tx.partner_id, "mobile", ""))
+
+        if not first_name:
+            raise BadRequest("Customer first name is required.")
+        if not email or "@" not in email:
+            raise BadRequest("Customer email is required.")
+        if not phone:
+            raise BadRequest("Customer phone must be in valid PH format (e.g. +63917xxxxxxx).")
+
+        # Public callback base URL (not request.host_url)
+        base_url = self._public_base_url(provider)
 
         url = "%s/checkout/v1/checkouts" % provider._maya_get_api_base_url()
         timeout = provider.maya_api_timeout or 30
@@ -104,24 +187,25 @@ class MayaController(http.Controller):
                 "currency": tx.currency_id.name,
             },
             "buyer": {
-                "firstName": tx.partner_id.name or "",
+                "firstName": first_name,
+                "lastName": last_name or first_name,
                 "contact": {
-                    "email": tx.partner_id.email or "",
-                    "phone": tx.partner_id.phone or "",
+                    "email": email,
+                    "phone": phone,
                 },
             },
             "requestReferenceNumber": tx.reference,
             "redirectUrl": {
-                "success": request.httprequest.host_url + "payment/maya/success?tx_id=%s" % tx.id,
-                "failure": request.httprequest.host_url + "payment/maya/failure?tx_id=%s" % tx.id,
-                "cancel": request.httprequest.host_url + "payment/maya/cancel?tx_id=%s" % tx.id,
+                "success": "%s/payment/maya/success?tx_id=%s&access_token=%s" % (base_url, tx.id, tx_access_token),
+                "failure": "%s/payment/maya/failure?tx_id=%s&access_token=%s" % (base_url, tx.id, tx_access_token),
+                "cancel": "%s/payment/maya/cancel?tx_id=%s&access_token=%s" % (base_url, tx.id, tx_access_token),
             },
         }
 
         _logger.info("Maya checkout request tx=%s ref=%s", tx.id, tx.reference)
 
         try:
-            res = requests.post(url, headers=headers, data=json.dumps(payload), timeout=timeout)
+            res = requests.post(url, headers=headers, json=payload, timeout=timeout)
         except requests.RequestException:
             _logger.exception("Maya checkout API unreachable tx=%s", tx.id)
             raise BadRequest("Could not reach Maya API.")
@@ -135,19 +219,29 @@ class MayaController(http.Controller):
             raise BadRequest("Invalid response from Maya API.")
 
         if res.status_code not in (200, 201):
-            raise BadRequest(response_data.get("message") or "Maya checkout failed.")
+            msg = (
+                response_data.get("message")
+                or response_data.get("error")
+                or "Maya checkout failed."
+            )
+            _logger.warning("Maya checkout failed tx=%s message=%s", tx.id, msg)
+            raise BadRequest(msg)
 
         checkout_id = response_data.get("checkoutId")
         redirect_url = response_data.get("redirectUrl")
         if not checkout_id or not redirect_url:
             raise BadRequest("Maya response missing checkoutId or redirectUrl.")
 
-        # Keep checkout id, but DO NOT set provider_reference/final state here.
-        tx.write({
-            'maya_checkout_id': checkout_id,
+        # Keep checkout id only; do NOT finalize provider_reference/state here.
+        write_vals = {
             'maya_transaction_id': checkout_id,  # backward compatibility
             'maya_status': 'checkout_created',
-        })
+        }
+        # If field exists in your module, store it too.
+        if 'maya_checkout_id' in tx._fields:
+            write_vals['maya_checkout_id'] = checkout_id
+
+        tx.write(write_vals)
 
         return redirect(redirect_url, code=302)
 
@@ -164,6 +258,7 @@ class MayaController(http.Controller):
         Webhook is source of truth.
         """
         tx_id = post.get('tx_id')
+        access_token = post.get('access_token')
         try:
             tx_id = int(tx_id)
         except (TypeError, ValueError):
@@ -172,9 +267,15 @@ class MayaController(http.Controller):
         tx = request.env['payment.transaction'].sudo().browse(tx_id)
         if not tx.exists() or tx.provider_id.code != 'maya':
             return request.redirect('/payment/status')
+        if not payment_utils.check_access_token(access_token, tx.reference, tx.partner_id.id):
+            return request.redirect('/payment/status')
 
         if "success" in request.httprequest.path:
             redirect_state = "redirect_success"
+            try:
+                tx._maya_try_mark_done_from_status_api()
+            except Exception:
+                _logger.exception("Maya status fallback error tx=%s", tx.id)
         elif "failure" in request.httprequest.path:
             redirect_state = "redirect_failure"
         else:
@@ -227,7 +328,16 @@ class MayaController(http.Controller):
 
         scenario = tx_model._maya_extract_scenario(payload, default_scenario=route_scenario)
 
-        provider = provider_model._maya_find_provider_for_webhook(headers=headers, raw_body=raw_body)
+        try:
+            provider = provider_model._maya_find_provider_for_webhook(
+                headers=headers,
+                raw_body=raw_body,
+                remote_addr=request.httprequest.remote_addr,
+            )
+        except Exception:
+            _logger.exception("Maya webhook provider verification error scenario=%s", scenario)
+            provider = False
+
         if not provider:
             _logger.warning("Maya webhook verification failed scenario=%s", scenario)
             return self._json_response({"ok": False, "error": "Invalid signature/auth"}, status=401)
@@ -248,7 +358,7 @@ class MayaController(http.Controller):
             return self._json_response({"ok": True, "duplicate": True}, status=200)
 
         try:
-            tx = tx_model._maya_resolve_from_webhook_payload(payload)
+            tx = tx_model._maya_resolve_from_webhook_payload(payload, provider=provider)
             if not tx:
                 webhook_event.write({
                     'state': 'ignored',

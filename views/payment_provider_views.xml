@@ -12,6 +12,7 @@
                 <group>
                     <field name="maya_public_key" password="True"/>
                     <field name="maya_secret_key" password="True"/>
+                    <field name="maya_api_timeout"/>
                 </group>
             </xpath>
         </field>
